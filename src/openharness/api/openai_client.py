@@ -296,6 +296,16 @@ class OpenAICompatibleClient:
             # that requires reasoning_content on every assistant message.
             params.pop("stream_options", None)
 
+        from openharness.services.trace import trace
+
+        trace(
+            "api.openai.stream",
+            "POST /chat/completions (streaming)",
+            model=request.model,
+            messages=len(openai_messages),
+            tools=len(openai_tools or []),
+        )
+
         # Collect full response while streaming text deltas
         collected_content = ""
         collected_reasoning = ""

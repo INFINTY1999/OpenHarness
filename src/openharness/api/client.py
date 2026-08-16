@@ -227,6 +227,18 @@ class AnthropicApiClient:
             }
             params["extra_headers"] = {"x-client-request-id": str(uuid.uuid4())}
 
+        from openharness.services.trace import trace
+
+        trace(
+            "api.anthropic.stream",
+            "POST /v1/messages (streaming)",
+            base_url=self._base_url or "https://api.anthropic.com",
+            model=params["model"],
+            messages=len(params["messages"]),
+            tools=len(params.get("tools") or []),
+            oauth=self._claude_oauth,
+        )
+
         try:
             stream_api = self._client.beta.messages if self._claude_oauth else self._client.messages
             async with stream_api.stream(**params) as stream:
@@ -247,6 +259,11 @@ class AnthropicApiClient:
             raise _translate_api_error(exc) from exc
 
         usage = getattr(final_message, "usage", None)
+        trace(
+            "api.anthropic.complete",
+            stop_reason=getattr(final_message, "stop_reason", None),
+            blocks=len(getattr(final_message, "content", []) or []),
+        )
         yield ApiMessageCompleteEvent(
             message=assistant_message_from_api(final_message),
             usage=UsageSnapshot(

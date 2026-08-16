@@ -123,14 +123,18 @@ async def launch_react_tui(
     permission_mode: str | None = None,
 ) -> int:
     """Launch the React terminal frontend as the default UI."""
+    from openharness.services.trace import trace
+
     frontend_dir = get_frontend_dir()
     package_json = frontend_dir / "package.json"
     if not package_json.exists():
         raise RuntimeError(f"React terminal frontend is missing: {package_json}")
 
     npm = _resolve_npm()
+    trace("ui.frontend.resolve", frontend_dir=str(frontend_dir))
 
     if not (frontend_dir / "node_modules").exists():
+        trace("ui.frontend.npm_install", "node_modules missing; installing frontend deps")
         install = await asyncio.create_subprocess_exec(
             npm,
             "install",
@@ -142,23 +146,30 @@ async def launch_react_tui(
             raise RuntimeError("Failed to install React terminal frontend dependencies")
 
     env = os.environ.copy()
+    backend_command = build_backend_command(
+        cwd=cwd or str(Path.cwd()),
+        model=model,
+        max_turns=max_turns,
+        base_url=base_url,
+        system_prompt=system_prompt,
+        api_key=api_key,
+        api_format=api_format,
+        permission_mode=permission_mode,
+    )
+    trace(
+        "ui.frontend.backend_command",
+        "the frontend spawns this as the Python backend host",
+        command=" ".join(backend_command),
+    )
     env["OPENHARNESS_FRONTEND_CONFIG"] = json.dumps(
         {
-            "backend_command": build_backend_command(
-                cwd=cwd or str(Path.cwd()),
-                model=model,
-                max_turns=max_turns,
-                base_url=base_url,
-                system_prompt=system_prompt,
-                api_key=api_key,
-                api_format=api_format,
-                permission_mode=permission_mode,
-            ),
+            "backend_command": backend_command,
             "initial_prompt": prompt,
             "theme": _resolve_theme(),
         }
     )
     tsx_cmd = _resolve_tsx(frontend_dir)
+    trace("ui.frontend.launch", command=" ".join((*tsx_cmd, "src/index.tsx")))
     process = await asyncio.create_subprocess_exec(
         *tsx_cmd,
         "src/index.tsx",
@@ -168,7 +179,9 @@ async def launch_react_tui(
         stdout=None,
         stderr=None,
     )
-    return await process.wait()
+    exit_code = await process.wait()
+    trace("ui.frontend.exit", exit_code=exit_code)
+    return exit_code
 
 
 __all__ = ["build_backend_command", "get_frontend_dir", "launch_react_tui"]

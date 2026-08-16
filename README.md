@@ -796,6 +796,7 @@ Useful contributor entry points:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, checks, and PR expectations
 - [`CHANGELOG.md`](CHANGELOG.md) for user-visible changes
 - [`docs/SHOWCASE.md`](docs/SHOWCASE.md) for real-world usage patterns worth documenting
+- [`docs/TRACING.md`](docs/TRACING.md) for `oh --trace`, which logs every step of a run (startup → prompt → model turns → tools)
 
 ---
 

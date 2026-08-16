@@ -40,6 +40,7 @@ from openharness.engine.stream_events import (
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
 from openharness.services.tool_outputs import tool_output_inline_chars, tool_output_preview_chars
+from openharness.services.trace import is_enabled as trace_enabled, preview, trace
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.base import ToolRegistry
 
@@ -695,9 +696,18 @@ async def run_query(
         last_compaction_result = await task
         return
 
+    trace(
+        "query.loop.start",
+        "entering the agent loop",
+        model=context.model,
+        messages=len(messages),
+        max_turns=context.max_turns,
+        max_tokens=effective_max_tokens,
+    )
     turn_count = 0
     while context.max_turns is None or turn_count < context.max_turns:
         turn_count += 1
+        trace("query.turn.start", turn=turn_count, messages=len(messages))
         if effective_max_tokens != context.max_tokens and not reported_token_clamp:
             reported_token_clamp = True
             yield StatusEvent(
@@ -713,6 +723,8 @@ async def run_query(
         compacted_messages, was_compacted = last_compaction_result
         if compacted_messages is not messages:
             messages[:] = compacted_messages
+        if was_compacted:
+            trace("query.compact", "history was auto-compacted", messages=len(messages))
         # ---------------------------------------------------------------
 
         # --- image preprocessing: convert ImageBlocks to text for non-vision models ---
@@ -722,6 +734,19 @@ async def run_query(
 
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()
+        tool_schema = context.tool_registry.to_api_schema()
+        trace(
+            "query.api.request",
+            "calling the model",
+            client=type(context.api_client).__name__,
+            model=context.model,
+            messages=len(messages),
+            tools=len(tool_schema),
+            system_chars=len(context.system_prompt),
+            max_tokens=effective_max_tokens,
+        )
+        api_started = time.monotonic()
+        first_delta_seen = False
 
         try:
             async for event in context.api_client.stream_message(
@@ -730,13 +755,27 @@ async def run_query(
                     messages=messages,
                     system_prompt=context.system_prompt,
                     max_tokens=effective_max_tokens,
-                    tools=context.tool_registry.to_api_schema(),
+                    tools=tool_schema,
                 )
             ):
                 if isinstance(event, ApiTextDeltaEvent):
+                    if not first_delta_seen:
+                        first_delta_seen = True
+                        trace(
+                            "query.api.first_delta",
+                            "model started streaming text",
+                            latency_ms=round((time.monotonic() - api_started) * 1000, 1),
+                        )
                     yield AssistantTextDelta(text=event.text), None
                     continue
                 if isinstance(event, ApiRetryEvent):
+                    trace(
+                        "query.api.retry",
+                        attempt=event.attempt,
+                        max_attempts=event.max_attempts,
+                        delay_s=round(event.delay_seconds, 2),
+                        error=event.message,
+                    )
                     yield StatusEvent(
                         message=(
                             f"Request failed; retrying in {event.delay_seconds:.1f}s "
@@ -748,8 +787,23 @@ async def run_query(
                 if isinstance(event, ApiMessageCompleteEvent):
                     final_message = event.message
                     usage = event.usage
+                    trace(
+                        "query.api.response",
+                        "model turn complete",
+                        elapsed_ms=round((time.monotonic() - api_started) * 1000, 1),
+                        stop_reason=event.stop_reason,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        text_chars=len(final_message.text),
+                        tool_uses=len(final_message.tool_uses),
+                    )
         except Exception as exc:
             error_msg = str(exc)
+            trace(
+                "query.api.error",
+                elapsed_ms=round((time.monotonic() - api_started) * 1000, 1),
+                error=f"{type(exc).__name__}: {error_msg}",
+            )
             if _is_completion_token_limit_error(exc):
                 supported_limit = _extract_completion_token_limit(exc)
                 if supported_limit is not None and effective_max_tokens > supported_limit:
@@ -804,6 +858,12 @@ async def run_query(
             messages.append(coordinator_context_message)
 
         if not final_message.tool_uses:
+            trace(
+                "query.loop.finish",
+                "no tool calls requested; the loop stops and the answer is final",
+                turns_used=turn_count,
+                answer=preview(final_message.text, 300),
+            )
             if context.hook_executor is not None:
                 await context.hook_executor.execute(
                     HookEvent.STOP,
@@ -815,6 +875,13 @@ async def run_query(
             return
 
         tool_calls = final_message.tool_uses
+        trace(
+            "query.tools.requested",
+            "model asked for tools; running them, then looping back to the model",
+            count=len(tool_calls),
+            mode="sequential" if len(tool_calls) == 1 else "concurrent",
+            tools=", ".join(tc.name for tc in tool_calls),
+        )
 
         if len(tool_calls) == 1:
             # Single tool: sequential (stream events immediately)
@@ -866,8 +933,15 @@ async def run_query(
                 ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
+        trace(
+            "query.tools.fed_back",
+            "tool results appended as a user message; next turn re-asks the model",
+            results=len(tool_results),
+            errors=sum(1 for r in tool_results if r.is_error),
+        )
 
     if context.max_turns is not None:
+        trace("query.loop.max_turns", "hit the turn cap before the model finished", max_turns=context.max_turns)
         raise MaxTurnsExceeded(context.max_turns)
     raise RuntimeError("Query loop exited without a max_turns limit or final response")
 
@@ -878,12 +952,19 @@ async def _execute_tool_call(
     tool_use_id: str,
     tool_input: dict[str, object],
 ) -> ToolResultBlock:
+    trace(
+        "tool.start",
+        tool=tool_name,
+        id=tool_use_id,
+        input=preview(tool_input, 300) if trace_enabled() else None,
+    )
     if context.hook_executor is not None:
         pre_hooks = await context.hook_executor.execute(
             HookEvent.PRE_TOOL_USE,
             {"tool_name": tool_name, "tool_input": tool_input, "event": HookEvent.PRE_TOOL_USE.value},
         )
         if pre_hooks.blocked:
+            trace("tool.blocked_by_hook", tool=tool_name, reason=pre_hooks.reason)
             return ToolResultBlock(
                 tool_use_id=tool_use_id,
                 content=pre_hooks.reason or f"pre_tool_use hook blocked {tool_name}",
@@ -895,6 +976,7 @@ async def _execute_tool_call(
     tool = context.tool_registry.get(tool_name)
     if tool is None:
         log.warning("unknown tool: %s", tool_name)
+        trace("tool.unknown", tool=tool_name)
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content=f"Unknown tool: {tool_name}",
@@ -905,6 +987,7 @@ async def _execute_tool_call(
         parsed_input = tool.input_model.model_validate(tool_input)
     except Exception as exc:
         log.warning("invalid input for %s: %s", tool_name, exc)
+        trace("tool.invalid_input", tool=tool_name, error=str(exc))
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content=f"Invalid input for {tool_name}: {exc}",
@@ -924,6 +1007,15 @@ async def _execute_tool_call(
         file_path=_file_path,
         command=_command,
     )
+    trace(
+        "tool.permission",
+        tool=tool_name,
+        allowed=decision.allowed,
+        needs_confirmation=decision.requires_confirmation,
+        read_only=tool.is_read_only(parsed_input),
+        path=_file_path,
+        reason=decision.reason or None,
+    )
     if not decision.allowed:
         if decision.requires_confirmation and context.permission_prompt is not None:
             log.debug("permission prompt for %s: %s", tool_name, decision.reason)
@@ -937,7 +1029,9 @@ async def _execute_tool_call(
                         "reason": decision.reason,
                     },
                 )
+            trace("tool.permission.prompt", "asking the user to approve", tool=tool_name)
             confirmed = await context.permission_prompt(tool_name, decision.reason)
+            trace("tool.permission.answer", tool=tool_name, approved=confirmed)
             if not confirmed:
                 log.debug("permission denied by user for %s", tool_name)
                 return ToolResultBlock(
@@ -947,6 +1041,7 @@ async def _execute_tool_call(
                 )
         else:
             log.debug("permission blocked for %s: %s", tool_name, decision.reason)
+            trace("tool.permission.blocked", tool=tool_name, reason=decision.reason)
             return ToolResultBlock(
                 tool_use_id=tool_use_id,
                 content=decision.reason or f"Permission denied for {tool_name}",
@@ -970,12 +1065,21 @@ async def _execute_tool_call(
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))
+    trace(
+        "tool.done",
+        tool=tool_name,
+        elapsed_ms=round(elapsed * 1000, 1),
+        is_error=result.is_error,
+        output_chars=len(result.output or ""),
+        output=preview(result.output or "", 200) if trace_enabled() else None,
+    )
     inline_output, artifact_path = _offload_tool_output_if_needed(
         tool_name=tool_name,
         tool_use_id=tool_use_id,
         output=result.output,
     )
     if artifact_path is not None:
+        trace("tool.output_offloaded", "output too large for context; saved to disk", path=str(artifact_path))
         _remember_active_artifact(context.tool_metadata, str(artifact_path))
     tool_result = ToolResultBlock(
         tool_use_id=tool_use_id,

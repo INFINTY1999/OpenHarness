@@ -2258,6 +2258,24 @@ def main(
         help="Enable debug logging",
         rich_help_panel="Advanced",
     ),
+    trace: bool = typer.Option(
+        False,
+        "--trace",
+        help="Log every step of the run (startup, prompt, model turns, tools) to a trace file",
+        rich_help_panel="Advanced",
+    ),
+    trace_file: str | None = typer.Option(
+        None,
+        "--trace-file",
+        help="Write the --trace log to this path instead of ~/.openharness/logs/trace-<date>.log",
+        rich_help_panel="Advanced",
+    ),
+    trace_stderr: bool = typer.Option(
+        False,
+        "--trace-stderr",
+        help="With --trace, also mirror trace lines to stderr (best with -p; the TUI owns the terminal)",
+        rich_help_panel="Advanced",
+    ),
     mcp_config: Optional[list[str]] = typer.Option(
         None,
         "--mcp-config",
@@ -2290,6 +2308,8 @@ def main(
     import asyncio
     import logging
 
+    from openharness.services import trace as trace_module
+
     if debug:
         logging.basicConfig(
             level=logging.DEBUG,
@@ -2300,6 +2320,22 @@ def main(
     elif os.environ.get("OPENHARNESS_LOG_LEVEL"):
         lvl = getattr(logging, os.environ["OPENHARNESS_LOG_LEVEL"].upper(), logging.WARNING)
         logging.basicConfig(level=lvl, format="%(asctime)s [%(name)s] %(levelname)s %(message)s", stream=sys.stderr)
+
+    # --trace exports OPENHARNESS_TRACE/_FILE so the backend subprocess the
+    # React frontend spawns appends to the very same trace file.
+    if trace or trace_file or trace_stderr:
+        resolved_trace_path = trace_module.configure(
+            path=trace_file,
+            mirror_stderr=trace_stderr,
+        )
+        print(f"Tracing this run to: {resolved_trace_path}", file=sys.stderr, flush=True)
+    trace_module.trace(
+        "cli.start",
+        argv=" ".join(sys.argv[1:]) or "(no args)",
+        cwd=cwd,
+        model=model or "(from settings)",
+        permission_mode=permission_mode or "(from settings)",
+    )
 
     if dangerously_skip_permissions:
         permission_mode = "full_auto"
@@ -2416,6 +2452,7 @@ def main(
         if not prompt:
             print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
             raise typer.Exit(1)
+        trace_module.trace("cli.mode", mode="print", prompt=prompt, output_format=output_format or "text")
         asyncio.run(
             run_print_mode(
                 prompt=prompt,
@@ -2434,6 +2471,7 @@ def main(
         return
 
     if task_worker:
+        trace_module.trace("cli.mode", mode="task-worker")
         asyncio.run(
             run_task_worker(
                 cwd=cwd,
@@ -2448,6 +2486,11 @@ def main(
         )
         return
 
+    trace_module.trace(
+        "cli.mode",
+        mode="backend-host" if backend_only else "interactive-repl",
+        max_turns=max_turns,
+    )
     asyncio.run(
         run_repl(
             prompt=None,

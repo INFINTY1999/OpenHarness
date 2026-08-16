@@ -36,8 +36,7 @@ from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.protocol import BackendEvent, FrontendRequest, TranscriptItem
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
 from openharness.services.session_backend import SessionBackend
-
-log = logging.getLogger(__name__)
+from openharness.services.trace import trace
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +85,7 @@ class ReactBackendHost:
         self._last_tool_inputs: dict[str, dict] = {}
 
     async def run(self) -> int:
+        trace("backend.start", "backend host booting for the React frontend")
         self._bundle = await build_runtime(
             model=self._config.model,
             max_turns=self._config.max_turns,
@@ -117,6 +117,7 @@ class ReactBackendHost:
             )
         )
         await self._emit(self._status_snapshot())
+        trace("backend.ready", "sent ready + status to the frontend; waiting for input")
 
         reader = asyncio.create_task(self._read_requests())
         try:
@@ -163,11 +164,13 @@ class ReactBackendHost:
                 line = (request.line or "").strip()
                 if not line:
                     continue
+                trace("backend.submit_line", "user pressed enter in the TUI", line=line)
                 self._busy = True
                 try:
                     should_continue = await self._run_active_request(self._process_line(line))
                 finally:
                     self._busy = False
+                    trace("backend.line_done", "back to idle, ready for the next prompt")
                 if not should_continue:
                     await self._emit(BackendEvent(type="shutdown"))
                     break
@@ -193,6 +196,7 @@ class ReactBackendHost:
             except Exception as exc:  # pragma: no cover - defensive protocol handling
                 await self._emit(BackendEvent(type="error", message=f"Invalid request: {exc}"))
                 continue
+            trace("backend.request", "frontend -> backend", type=request.type)
             if request.type == "permission_response" and request.request_id in self._permission_requests:
                 future = self._permission_requests[request.request_id]
                 if not future.done():

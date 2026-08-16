@@ -13,6 +13,7 @@ from openharness.engine.query import AskUserPrompt, PermissionPrompt, QueryConte
 from openharness.engine.stream_events import AssistantTurnComplete, StreamEvent
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
+from openharness.services.trace import trace
 from openharness.tools.base import ToolRegistry
 
 
@@ -154,7 +155,15 @@ class QueryEngine:
         if user_message.text.strip() and not self._tool_metadata.pop("_suppress_next_user_goal", False):
             remember_user_goal(self._tool_metadata, user_message.text)
         self._messages.append(user_message)
+        trace(
+            "engine.submit",
+            "user message appended to history",
+            history=len(self._messages),
+            model=self._model,
+            max_turns=self._max_turns,
+        )
         if self._hook_executor is not None:
+            trace("engine.hook", event=HookEvent.USER_PROMPT_SUBMIT.value)
             await self._hook_executor.execute(
                 HookEvent.USER_PROMPT_SUBMIT,
                 {

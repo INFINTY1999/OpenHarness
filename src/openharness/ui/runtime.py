@@ -40,6 +40,7 @@ from openharness.plugins import load_plugins
 from openharness.prompts import build_runtime_system_prompt
 from openharness.state import AppState, AppStateStore
 from openharness.services.session_backend import DEFAULT_SESSION_BACKEND, SessionBackend
+from openharness.services.trace import is_enabled as trace_enabled, trace
 from openharness.tools import ToolRegistry, create_default_tool_registry
 from openharness.keybindings import load_keybindings
 
@@ -237,23 +238,55 @@ async def build_runtime(
         "active_profile": active_profile,
         "permission_mode": permission_mode,
     }
+    trace("runtime.build.start", "assembling the session runtime")
     settings = load_settings().merge_cli_overrides(**settings_overrides)
     cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(Path.cwd())
+    trace(
+        "runtime.settings",
+        "settings.json merged with CLI overrides",
+        model=settings.model,
+        api_format=settings.api_format,
+        base_url=settings.base_url or "(default)",
+        permission_mode=settings.permission.mode.value,
+        max_turns=settings.max_turns,
+        max_tokens=settings.max_tokens,
+        cwd=cwd,
+    )
     normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
     normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
     plugins = load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
+    trace(
+        "runtime.plugins",
+        plugins=", ".join(p.manifest.name for p in plugins if p.enabled) or "(none enabled)",
+        total=len(plugins),
+    )
     if api_client:
         resolved_api_client = api_client
     else:
         resolved_api_client = _resolve_api_client_from_settings(settings)
+    trace("runtime.api_client", client=type(resolved_api_client).__name__, injected=bool(api_client))
     mcp_manager = McpClientManager(load_mcp_server_configs(settings, plugins))
     await mcp_manager.connect_all()
+    trace(
+        "runtime.mcp",
+        connected=sum(1 for s in mcp_manager.list_statuses() if s.state == "connected"),
+        failed=sum(1 for s in mcp_manager.list_statuses() if s.state == "failed"),
+        servers=", ".join(s.name for s in mcp_manager.list_statuses()) or "(none)",
+    )
     tool_registry = create_default_tool_registry(mcp_manager)
     # Register plugin-provided tools
     for plugin in plugins:
         if plugin.enabled and plugin.tools:
             for tool in plugin.tools:
                 tool_registry.register(tool)
+    if trace_enabled():
+        tool_schema = tool_registry.to_api_schema()
+        trace(
+            "runtime.tools",
+            "tool schemas that will be sent to the model",
+            count=len(tool_schema),
+            names=", ".join(sorted(str(item.get("name", "?")) for item in tool_schema)),
+        )
     provider = detect_provider(settings)
     bridge_manager = get_bridge_manager()
     app_state = AppStateStore(
@@ -298,6 +331,11 @@ async def build_runtime(
         extra_skill_dirs=normalized_skill_dirs,
         extra_plugin_roots=normalized_plugin_roots,
         include_project_memory=include_project_memory,
+    )
+    trace(
+        "runtime.system_prompt",
+        "built from base prompt + env/skills/memory context",
+        chars=len(system_prompt_text),
     )
     from uuid import uuid4
 
@@ -357,13 +395,16 @@ async def build_runtime(
             [ConversationMessage.model_validate(m) for m in restore_messages]
         )
         engine.load_messages(restored)
+        trace("runtime.restore", "restored a saved conversation", messages=len(restored))
 
     # Start Docker sandbox if configured
     if settings.sandbox.enabled and settings.sandbox.backend == "docker":
         from openharness.sandbox.session import start_docker_sandbox
 
+        trace("runtime.sandbox.start", backend="docker", session_id=session_id)
         await start_docker_sandbox(settings, session_id, Path(cwd))
 
+    trace("runtime.build.done", "runtime ready", session_id=session_id, max_turns=engine_max_turns)
     return RuntimeBundle(
         api_client=resolved_api_client,
         cwd=cwd,
@@ -394,6 +435,7 @@ async def build_runtime(
 
 async def start_runtime(bundle: RuntimeBundle) -> None:
     """Run session start hooks."""
+    trace("runtime.hook", event=HookEvent.SESSION_START.value)
     await bundle.hook_executor.execute(
         HookEvent.SESSION_START,
         {"cwd": bundle.cwd, "event": HookEvent.SESSION_START.value},
@@ -403,6 +445,8 @@ async def start_runtime(bundle: RuntimeBundle) -> None:
 async def close_runtime(bundle: RuntimeBundle) -> None:
     """Close runtime-owned resources."""
     from openharness.sandbox.session import stop_docker_sandbox
+
+    trace("runtime.close", "tearing the session down")
 
     await stop_docker_sandbox()
     # Extract local environment rules from session before closing
@@ -534,6 +578,7 @@ async def handle_line(
     clear_output: ClearHandler,
 ) -> bool:
     """Handle one submitted line for either headless or TUI rendering."""
+    trace("input.received", "one submitted line", line=line, chars=len(line))
     if not bundle.external_api_client:
         bundle.hook_executor.update_registry(
             load_hook_registry(bundle.current_settings(), bundle.current_plugins())
@@ -557,9 +602,18 @@ async def handle_line(
     parsed = bundle.commands.lookup(line) or lookup_skill_slash_command(line, command_context)
     if parsed is not None:
         command, args = parsed
+        trace("input.slash_command", command=command.name, args=args)
         result = await command.handler(
             args,
             command_context,
+        )
+        trace(
+            "input.slash_command.result",
+            command=command.name,
+            submits_prompt=result.submit_prompt is not None,
+            continues_pending=result.continue_pending,
+            refresh_runtime=result.refresh_runtime,
+            should_exit=result.should_exit,
         )
         if result.refresh_runtime:
             refresh_runtime_client(bundle)
@@ -633,6 +687,7 @@ async def handle_line(
         sync_app_state(bundle)
         return not result.should_exit
 
+    trace("input.prompt", "not a slash command; sending to the model", prompt=line)
     settings = bundle.current_settings()
     if bundle.enforce_max_turns:
         bundle.engine.set_max_turns(settings.max_turns)
@@ -644,11 +699,17 @@ async def handle_line(
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
+    trace(
+        "input.system_prompt",
+        "system prompt rebuilt for this prompt (skills are matched against it)",
+        chars=len(system_prompt),
+    )
     bundle.engine.set_system_prompt(system_prompt)
     try:
         async for event in bundle.engine.submit_message(line):
             await render_event(event)
     except MaxTurnsExceeded as exc:
+        trace("input.max_turns_exceeded", max_turns=exc.max_turns)
         await print_system(f"Stopped after {exc.max_turns} turns (max_turns).")
         pending = _format_pending_tool_results(bundle.engine.messages)
         if pending:
@@ -672,6 +733,13 @@ async def handle_line(
         usage=bundle.engine.total_usage,
         session_id=bundle.session_id,
         tool_metadata=bundle.engine.tool_metadata,
+    )
+    trace(
+        "input.complete",
+        "turn finished; session snapshot saved",
+        messages=len(bundle.engine.messages),
+        input_tokens=bundle.engine.total_usage.input_tokens,
+        output_tokens=bundle.engine.total_usage.output_tokens,
     )
     sync_app_state(bundle)
     return True
